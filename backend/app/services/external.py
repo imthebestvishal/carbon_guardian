@@ -17,10 +17,17 @@ DATAGOV_MIN_REFRESH_SECONDS = 180
 
 
 def aqi_label(aqi: int) -> str:
-    if aqi <= 80:
-        return "Healthy"
+    """Standard 5-tier AQI classification (US EPA scale)."""
+    if aqi <= 50:
+        return "Good"
+    if aqi <= 100:
+        return "Moderate"
+    if aqi <= 150:
+        return "Unhealthy (Sensitive)"
     if aqi <= 200:
         return "Unhealthy"
+    if aqi <= 300:
+        return "Very Unhealthy"
     return "Hazardous"
 
 
@@ -323,23 +330,29 @@ async def reverse_geocode(lat: float, lon: float) -> dict[str, str]:
         async with httpx.AsyncClient(timeout=9, headers={"User-Agent": "CarbonGuardianAI/1.0"}) as client:
             response = await client.get(
                 "https://nominatim.openstreetmap.org/reverse",
-                params={"lat": lat, "lon": lon, "format": "jsonv2"},
+                params={"lat": lat, "lon": lon, "format": "json", "addressdetails": 1},
             )
             response.raise_for_status()
             data = response.json()
             address = data.get("address", {})
-            city = (
-                address.get("city")
-                or address.get("town")
-                or address.get("village")
-                or address.get("county")
-                or ""
-            )
+            logger.debug("RAW ADDRESS: %s", address)
+            print("RAW ADDRESS:", address)
+
+            # Smallest locality first — suburb > neighbourhood > village > town > city
             local_area = (
                 address.get("suburb")
                 or address.get("neighbourhood")
                 or address.get("hamlet")
                 or address.get("quarter")
+                or address.get("village")
+                or address.get("town")
+                or ""
+            )
+            city = (
+                address.get("city")
+                or address.get("town")
+                or address.get("village")
+                or address.get("county")
                 or ""
             )
             return {"city": city, "local_area": local_area}
@@ -368,27 +381,55 @@ async def geocode_city(city: str) -> tuple[float, float]:
         raise HTTPException(status_code=503, detail=f"Geocoding failed: {exc}") from exc
 
 
-async def search_locations(query: str) -> list[dict[str, Any]]:
+async def search_locations(query: str, lat: float | None = None, lon: float | None = None) -> list[dict[str, Any]]:
     import httpx
 
     try:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": query,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "extratags": 1,
+            "limit": 8,
+        }
+
+        if lat is not None and lon is not None:
+            params["viewbox"] = f"{lon-0.2},{lat+0.2},{lon+0.2},{lat-0.2}"
+            params["bounded"] = 1
+
+        headers = {
+            "User-Agent": "carbon-guardian-app"
+        }
+
         async with httpx.AsyncClient(timeout=9) as client:
-            response = await client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": query, "count": 5, "language": "en", "format": "json"},
-            )
-            response.raise_for_status()
-            results = response.json().get("results", [])
-            return [
-                {
-                    "name": item.get("name"),
-                    "admin1": item.get("admin1"),
-                    "country": item.get("country"),
-                    "lat": item.get("latitude"),
-                    "lon": item.get("longitude"),
-                }
-                for item in results
-            ]
+            res = await client.get(url, params=params, headers=headers)
+            res.raise_for_status()
+            data = res.json()
+
+        results = []
+        for item in data:
+            results.append({
+                "name": item.get("display_name", "").split(",")[0],
+                "full": item.get("display_name"),
+                "lat": float(item["lat"]),
+                "lon": float(item["lon"]),
+                "type": item.get("type"),
+                "category": item.get("class")
+            })
+
+        def score(item):
+            item_name = item["name"].lower()
+            q = query.lower()
+            s = 0
+            if q in item_name:
+                s += 10
+            if item["type"] in ["hospital", "school", "college", "university", "clinic", "monument"]:
+                s += 5
+            return s
+
+        results.sort(key=score, reverse=True)
+        return results
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Search provider failed: {exc}") from exc
 
@@ -396,6 +437,7 @@ async def search_locations(query: str) -> list[dict[str, Any]]:
 async def fetch_environment(lat: float, lon: float, city_hint: str | None = None) -> dict[str, Any]:
     try:
         import httpx
+        import asyncio
     except Exception as exc:
         logger.exception("environment fetch failed lat=%s lon=%s", lat, lon)
         cached = _latest_cached(lat, lon)
@@ -404,6 +446,27 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
         raise HTTPException(status_code=503, detail="Install httpx to fetch environment data") from exc
 
     _validate_coordinates(lat, lon)
+
+    # FAST PATH: Return cached data instantly if fresh (within 5 minutes)
+    # This eliminates ALL external API calls for repeat requests
+    cached_nearby = _latest_cached(lat, lon)
+    if _cached_is_fresh(cached_nearby, 300):
+        cached_aqi = _validated_aqi(cached_nearby.get("aqi"))
+        return {
+            "lat": lat,
+            "lon": lon,
+            "city": cached_nearby.get("city") or city_hint or "Delhi",
+            "local_area": cached_nearby.get("local_area") or cached_nearby.get("city") or "",
+            "aqi": cached_aqi,
+            "aqi_label": aqi_label(cached_aqi),
+            "temperature": round(float(cached_nearby.get("temperature", 0)), 1),
+            "co2_ppm": float(cached_nearby.get("co2_ppm", 420)),
+            "source": {"aqi": cached_nearby.get("aqi_source") or "Cache", "temperature": cached_nearby.get("temperature_source") or "Cache"},
+            "aqi_station": cached_nearby.get("aqi_station"),
+            "fallback": "cache_fast",
+            "detail": "Returned cached environment for instant response.",
+        }
+
     openweather_key = os.getenv("OPENWEATHER_API_KEY")
     waqi_token = os.getenv("WAQI_API_TOKEN")
     datagov_key = (
@@ -411,19 +474,38 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
         or os.getenv("DATA_GOV_API_KEY")
         or "579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b"
     )
-    location = await reverse_geocode(lat, lon)
+
+    # PARALLEL: Fire reverse geocode + temperature at the same time
+    # Use OpenWeather key for temperature when available (more accurate)
+    location_task = reverse_geocode(lat, lon)
+    temperature_task = _fetch_temperature(lat, lon, openweather_key)
+    location, (temperature, temperature_source) = await asyncio.gather(
+        location_task, temperature_task
+    )
+
     city = city_hint or location["city"] or "Location unavailable"
     local_area = location["local_area"] or city
-    cached_nearby = _latest_cached(lat, lon)
-
-    # Temperature is always fetched from free Open-Meteo for real-time updates.
-    temperature, temperature_source = await _fetch_temperature(lat, lon, None)
 
     try:
         aqi_source = ""
         aqi_station = None
         co2_ppm = 420.0
-        if datagov_key:
+
+        # PRIORITY ORDER: OpenWeather (global, reliable) → WAQI → Data.gov.in
+        if openweather_key:
+            aqi_value, components = await _fetch_openweather_aqi(lat, lon, openweather_key)
+            aqi_source = "OpenWeather"
+            aqi_station = None
+            co2_ppm = round(420 + (float(components.get("co", 0.0)) / 1000.0), 1)
+            logger.info("[AQI] OpenWeather live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
+        elif waqi_token:
+            aqi_value, waqi_city_name = await _fetch_waqi_aqi(lat, lon, waqi_token)
+            aqi_source = "WAQI"
+            aqi_station = waqi_city_name or None
+            if not location["city"] and waqi_city_name:
+                city = waqi_city_name
+            logger.info("[AQI] WAQI live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
+        elif datagov_key:
             if _cached_is_fresh(cached_nearby, DATAGOV_MIN_REFRESH_SECONDS):
                 cached_aqi = _validated_aqi(cached_nearby.get("aqi"))
                 payload = {
@@ -445,17 +527,7 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
             aqi_value, matched_area = await _fetch_datagov_aqi(lat, lon, city, datagov_key)
             aqi_source = "Data.gov.in"
             aqi_station = matched_area
-        elif waqi_token:
-            aqi_value, waqi_city_name = await _fetch_waqi_aqi(lat, lon, waqi_token)
-            aqi_source = "WAQI"
-            aqi_station = waqi_city_name or None
-            if not location["city"] and waqi_city_name:
-                city = waqi_city_name
-        elif openweather_key:
-            aqi_value, components = await _fetch_openweather_aqi(lat, lon, openweather_key)
-            aqi_source = "OpenWeather"
-            aqi_station = None
-            co2_ppm = round(420 + (float(components.get("co", 0.0)) / 1000.0), 1)
+            logger.info("[AQI] Data.gov.in live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
         else:
             cached = _latest_cached(lat, lon)
             if cached:
@@ -502,8 +574,8 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
             return {
                 "lat": lat,
                 "lon": lon,
-                "city": cached.get("city") or city,
-                "local_area": cached.get("local_area") or local_area,
+                "city": city,          # always use fresh reverse geocode
+                "local_area": local_area,  # always use fresh reverse geocode
                 "aqi": cached_aqi,
                 "aqi_label": aqi_label(cached_aqi),
                 "temperature": round(float(temperature), 1),
@@ -515,8 +587,22 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
                 "fallback": "cache",
                 "detail": f"Live provider unavailable. Returned cached environment. Reason: {exc.detail}",
             }
-        raise exc
+        # No cache at all — return location with default AQI so UI doesn't break
+        return {
+            "lat": lat,
+            "lon": lon,
+            "city": city,
+            "local_area": local_area,
+            "aqi": 100,
+            "aqi_label": aqi_label(100),
+            "temperature": round(float(temperature), 1),
+            "co2_ppm": 420.0,
+            "source": {"aqi": "Default (provider unavailable)", "temperature": temperature_source},
+            "fallback": "no_aqi_provider",
+            "detail": f"AQI provider temporarily unavailable. Showing default AQI. Reason: {exc.detail}",
+        }
     except Exception as exc:
+        logger.warning("[AQI] All providers failed: %s", exc)
         cached = _latest_cached(lat, lon)
         if cached:
             cached_aqi = _validated_aqi(cached.get("aqi"))
@@ -536,4 +622,17 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
                 "fallback": "cache",
                 "detail": f"Live provider unavailable. Returned cached environment. Reason: {exc}",
             }
-        raise HTTPException(status_code=503, detail=f"Environment provider failed and no cache available: {exc}") from exc
+        # No cache at all — return location with default AQI so UI doesn't break
+        return {
+            "lat": lat,
+            "lon": lon,
+            "city": city,
+            "local_area": local_area,
+            "aqi": 100,
+            "aqi_label": aqi_label(100),
+            "temperature": round(float(temperature), 1),
+            "co2_ppm": 420.0,
+            "source": {"aqi": "Default (all providers failed)", "temperature": temperature_source},
+            "fallback": "no_provider",
+            "detail": f"All AQI providers failed and no cache available. Showing default AQI. Reason: {exc}",
+        }

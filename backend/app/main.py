@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+from dotenv import load_dotenv
+
+# Load .env file BEFORE any module reads os.getenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path

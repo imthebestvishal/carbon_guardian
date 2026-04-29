@@ -26,7 +26,7 @@ class CreateUserIn(BaseModel):
 
 class ActionIn(BaseModel):
     user_id: int
-    action: str = Field(pattern="^(metro|public_transport|carpool|bike|walk|walk_cycle|avoid_travel|cab|car)$")
+    action: str = Field(pattern="^(metro|public_transport|carpool|bike|walk|walk_cycle|avoid_travel|cab|car|bus|train|airplane|energy|waste|food)$")
     accepted: bool
     recommendation_id: int | None = None
     recommended_action: str | None = None
@@ -36,9 +36,9 @@ class ActionIn(BaseModel):
 
 
 class SimulateIn(BaseModel):
-    current_users: int = Field(ge=1, le=50_000_000)
-    ev_adoption_percent: float = Field(ge=0, le=100)
-    avg_daily_km: float = Field(ge=1, le=200)
+    current: str = "cab"
+    alternative: str = "bike"
+    distance_km: float = Field(ge=1, le=200)
 
 
 class RedeemIn(BaseModel):
@@ -73,7 +73,7 @@ class AiRecommendIn(BaseModel):
     distance_km: float = Field(ge=0)
     duration_min: float = Field(ge=0)
     aqi: float = Field(ge=0, le=500)
-    current_action: Literal["walk", "bike", "metro", "cab"] = "cab"
+    current_action: Literal["walk", "bike", "bus", "metro", "train", "cab", "airplane"] = "cab"
 
 
 @router.post("/user")
@@ -178,6 +178,9 @@ def _normalize_action(action: str) -> str:
         "walk": "walk",
         "metro": "metro",
         "bike": "bike",
+        "bus": "bus",
+        "train": "train",
+        "airplane": "airplane",
         "avoid_travel": "avoid_travel",
         "cab": "cab",
         "car": "car",
@@ -236,9 +239,13 @@ async def environment(lat: float | None = None, lon: float | None = None, city: 
 
 
 @router.get("/search")
-async def search(query: str = Query(min_length=2, max_length=80)) -> dict:
+async def search(
+    query: str = Query(min_length=2, max_length=80),
+    lat: float | None = None,
+    lon: float | None = None
+) -> dict:
     try:
-        items = await search_locations(query)
+        items = await search_locations(query, lat, lon)
         return {"items": items}
     except Exception as exc:
         logger.exception("search failed for query=%s", query)
@@ -559,17 +566,17 @@ def carbon_score(user_id: int) -> dict:
 
 @router.post("/simulate")
 def simulate(payload: SimulateIn) -> dict:
-    car_kg = 0.171
-    ev_kg = 0.053
-    switched_users = payload.current_users * (payload.ev_adoption_percent / 100.0)
-    co2_saved_daily = switched_users * payload.avg_daily_km * (car_kg - ev_kg)
-    co2_saved = co2_saved_daily * 365
-    aqi_improvement = min(35.0, (co2_saved / 1_000_000) * 1.6)
-    temperature_reduction = min(1.2, (co2_saved / 1_000_000) * 0.045)
+    from app.services.emissions import TRANSPORT_EMISSIONS
+    
+    curr_em = TRANSPORT_EMISSIONS.get(payload.current, 0.18) * payload.distance_km
+    alt_em = TRANSPORT_EMISSIONS.get(payload.alternative, 0) * payload.distance_km
+    saved = max(0, curr_em - alt_em)
+    
     return {
-        "co2_saved": round(co2_saved, 2),
-        "aqi_improvement": round(aqi_improvement, 2),
-        "temperature_reduction": round(temperature_reduction, 3),
+        "emissions_saved": round(saved, 2),
+        "current_emissions": round(curr_em, 2),
+        "alternative_emissions": round(alt_em, 2),
+        "potential_points": int(saved * 10) + 10
     }
 
 
@@ -592,9 +599,28 @@ def redeem(payload: RedeemIn) -> dict:
 
 
 @router.get("/leaderboard")
-def leaderboard() -> dict:
+def leaderboard() -> list[dict]:
     with get_db() as db:
         rows = db.execute(
-            "SELECT id, name, green_points, streak_days, preferred_transport FROM users ORDER BY green_points DESC LIMIT 20"
+            "SELECT name, green_points as points, streak_days, preferred_transport FROM users ORDER BY green_points DESC LIMIT 20"
         ).fetchall()
-    return {"items": [dict(row) for row in rows]}
+    return [{"rank": i + 1, **dict(row)} for i, row in enumerate(rows)]
+
+
+@router.get("/community/stats")
+def community_stats() -> dict:
+    with get_db() as db:
+        total_points = db.execute("SELECT SUM(green_points) as total FROM users").fetchone()["total"] or 0
+        total_users = db.execute("SELECT COUNT(*) as count FROM users").fetchone()["count"] or 1
+        
+        # Aggregate stats
+        trees_today = int(total_points / 50) + 120 # Mocking some growth for demo
+        target_percent = min(98, int((total_points / 10000) * 100) if total_points > 0 else 0)
+        
+        return {
+            "total_points": total_points,
+            "total_users": total_users,
+            "trees_today": trees_today,
+            "target_percent": target_percent,
+            "active_now": max(1, int(total_users * 0.15))
+        }

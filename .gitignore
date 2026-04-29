@@ -5,3 +5,21 @@ frontend/dist/
 __pycache__/
 *.pyc
 .env
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Environment files
+.env
+
+# Build
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,15 +1,31 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from sqlite3 import Connection
 
 from app.services.emissions import TRANSPORT_EMISSION_KG_PER_KM, co2_saving
 
-ACTIONS = ["metro", "bike", "walk", "avoid_travel", "cab"]
-TRIP_ACTIONS = ["walk", "bike", "metro", "cab"]
-EMISSION_FACTORS = {"cab": 120.0, "bike": 0.0, "metro": 40.0, "walk": 0.0}
+logger = logging.getLogger("carbon_guardian.recommender")
+
+ACTIONS = ["walk", "bike", "bus", "metro", "train", "cab", "airplane", "avoid_travel"]
+TRIP_ACTIONS = ["walk", "bike", "bus", "metro", "train", "cab", "airplane"]
+
+# =============================================================================
+# Structured transport mode configuration
+# min/max = realistic distance range in km; emission = kg CO₂ per km
+# =============================================================================
+TRANSPORT_MODES = {
+    "walk":     {"min": 0,   "max": 1,     "emission": 0.0},
+    "bike":     {"min": 0,   "max": 5,     "emission": 0.0},
+    "bus":      {"min": 2,   "max": 20,    "emission": 0.08},
+    "metro":    {"min": 3,   "max": 30,    "emission": 0.05},
+    "train":    {"min": 20,  "max": 500,   "emission": 0.04},
+    "cab":      {"min": 1,   "max": 50,    "emission": 0.18},
+    "airplane": {"min": 200, "max": 10000, "emission": 0.25},
+}
 
 
 @dataclass
@@ -203,20 +219,160 @@ class TFRSEmbeddingRecommender:
 
         probs = [math.exp(x) for x in shifted]
         total = sum(probs) or 1.0
+        valid_modes = get_valid_modes(distance)
         ranked: list[RankedRecommendation] = []
         for action, raw in zip(ACTIONS, probs):
             confidence = raw / total
+
+            # Boost heuristics based on distance, AQI, and mode validity
+            if action not in valid_modes:
+                confidence *= 0.05  # heavily penalise out-of-range modes
+            elif action == "walk":
+                if distance <= 1.0 and aqi < 100:
+                    confidence += 0.6
+                else:
+                    confidence -= 0.4
+            elif action == "bike":
+                if distance <= 5.0 and aqi < 150:
+                    confidence += 0.5
+                else:
+                    confidence -= 0.3
+            elif action == "bus":
+                if 2.0 <= distance <= 20.0:
+                    confidence += 0.35
+            elif action == "metro":
+                if distance > 3.0:
+                    confidence += 0.4
+            elif action == "train":
+                if distance >= 20.0:
+                    confidence += 0.45
+            elif action == "cab":
+                if aqi >= 200 or distance >= 15.0:
+                    confidence += 0.3
+            elif action == "airplane":
+                if distance >= 200.0:
+                    confidence += 0.5
+                else:
+                    confidence *= 0.01  # absurd for short trips
+
+            confidence = max(0.01, confidence)
+
             reduction = co2_saving(baseline_action, action, distance)
             ranked.append(
                 RankedRecommendation(
                     action=action,
                     score=round(raw, 4),
-                    confidence=round(confidence, 3),
+                    confidence=confidence,
                     estimated_co2_reduction=reduction,
-                    reason="TensorFlow Recommenders ranking from behavior and context features.",
+                    reason="AI ranking adjusted by environmental context and distance."
                 )
             )
+
+        # Re-normalize confidence
+        new_total = sum(r.confidence for r in ranked)
+        for r in ranked:
+            r.confidence = round(r.confidence / new_total, 3)
+
         return sorted(ranked, key=lambda item: (item.confidence, item.estimated_co2_reduction), reverse=True)
+
+
+# =============================================================================
+# 🔴 HARD RULE LAYER — multi-modal distance-based filtering & overrides
+# =============================================================================
+
+def get_valid_modes(distance_km: float) -> list[str]:
+    """Return transport modes whose distance range includes the given distance."""
+    valid = []
+    for mode, config in TRANSPORT_MODES.items():
+        if config["min"] <= distance_km <= config["max"]:
+            valid.append(mode)
+    return valid if valid else ["cab"]  # fallback so we never return empty
+
+
+def calculate_emission(mode: str, distance_km: float) -> float:
+    """Calculate CO₂ emission (kg) for a mode over a given distance."""
+    factor = TRANSPORT_MODES.get(mode, {}).get("emission", TRANSPORT_EMISSION_KG_PER_KM.get(mode, 0.192))
+    return round(factor * distance_km, 3)
+
+
+def _apply_distance_rules(distance_km: float, aqi: float, model_action: str) -> str:
+    """Enforce realistic transport recommendations based on distance.
+
+    Pipeline: distance filter → hard rules → model fallback (constrained to valid modes).
+    """
+    valid_modes = get_valid_modes(distance_km)
+
+    # ── 🔴 SHORT DISTANCE OVERRIDE ──
+    if distance_km <= 0.5:
+        return "walk"
+
+    if distance_km <= 2.0:
+        return "bike"
+
+    # ── 🟡 MEDIUM DISTANCE (≤ 10 km) ──
+    if distance_km <= 10.0:
+        if aqi > 150:
+            return "metro" if "metro" in valid_modes else "bus" if "bus" in valid_modes else "cab"
+        return "bike" if "bike" in valid_modes else "bus" if "bus" in valid_modes else "metro"
+
+    # ── 🔵 LONG DISTANCE (≤ 100 km) ──
+    if distance_km <= 100.0:
+        if aqi > 150:
+            return "train" if "train" in valid_modes else "metro" if "metro" in valid_modes else "cab"
+        return "bus" if "bus" in valid_modes else "train" if "train" in valid_modes else "metro"
+
+    # ── ✈️ VERY LONG DISTANCE (> 200 km) ──
+    if distance_km > 200.0:
+        return "airplane"
+
+    # ── 🟢 GAP ZONE (100-200 km): model fallback constrained to valid modes ──
+    if model_action in valid_modes:
+        return model_action
+
+    return valid_modes[0]
+
+
+def _generate_reason(mode: str, distance_km: float, aqi: float) -> str:
+    """Human-readable explanation for the recommendation."""
+    if distance_km <= 0.5:
+        return "Very short distance — walking is fastest and zero emission."
+
+    if distance_km <= 2.0:
+        return "Short trip — biking is efficient and eco-friendly."
+
+    if distance_km <= 5.0:
+        if mode == "metro":
+            return "High AQI — metro reduces pollution exposure."
+        if mode == "bus":
+            return "Bus is practical and low emission for this distance."
+        return "Moderate distance — biking is efficient."
+
+    if distance_km <= 10.0:
+        if mode == "metro":
+            return "Metro is fast and low emission for medium distances."
+        if mode == "bus":
+            return "Bus covers this distance efficiently with low emissions."
+        return "Medium distance — public transit recommended."
+
+    if distance_km <= 100.0:
+        if mode == "train":
+            return "Train is the most efficient option for long distances."
+        if mode == "bus":
+            return "Bus is a practical low-emission choice for this range."
+        if mode == "metro":
+            return "Metro covers this corridor with low emissions."
+        return "Long distance — rail or bus recommended."
+
+    if mode == "airplane":
+        return "Very long distance — air travel is the only practical option."
+
+    if mode == "train":
+        return "Train offers efficient long-distance travel with low emissions."
+
+    if mode == "cab":
+        return "Cab recommended given current conditions."
+
+    return "Balanced recommendation based on distance, AQI, and your profile."
 
 
 def _baseline_action(profile: dict) -> str:
@@ -253,9 +409,31 @@ def get_recommendation(
 
     model_name = "tensorflow-recommenders"
 
+    # --- Model's raw top pick ---
+    model_top = ranked[0]
+
+    # --- 🔥 RULE LAYER: override model for short distances ---
+    final_action = _apply_distance_rules(distance_km, aqi, model_top.action)
+
+    # Debug logging (MANDATORY)
+    logger.info("[get_recommendation] Distance: %.2f km", distance_km)
+    logger.info("[get_recommendation] AQI: %.1f", aqi)
+    logger.info("[get_recommendation] Model output: %s", model_top.action)
+    logger.info("[get_recommendation] Final recommendation: %s", final_action)
+    print(f"[get_recommendation] Distance: {distance_km}, AQI: {aqi}, Model output: {model_top.action}, Final recommendation: {final_action}")
+
+    # If rule layer changed the action, re-sort ranked list so final_action is on top
+    if final_action != model_top.action:
+        for r in ranked:
+            if r.action == final_action:
+                r.confidence = max(r.confidence, model_top.confidence) + 0.01
+                r.reason = _generate_reason(final_action, distance_km, aqi)
+                break
+        ranked = sorted(ranked, key=lambda item: (item.confidence, item.estimated_co2_reduction), reverse=True)
+
     top = ranked[0]
     ranked_payload = [item.__dict__ for item in ranked]
-    impact_percent = int(max(0, min(95, round(top.estimated_co2_reduction * 100))))
+    impact_percent = int(_impact_percent("cab", final_action))
     cursor = db.execute(
         """
         INSERT INTO recommendations
@@ -265,9 +443,9 @@ def get_recommendation(
         (
             user_id,
             f"Likely next action: {base_action}",
-            f"Use {top.action}",
+            f"Use {final_action}",
             impact_percent,
-            top.action,
+            final_action,
             json.dumps(ranked_payload),
             top.confidence,
             top.estimated_co2_reduction,
@@ -282,7 +460,7 @@ def get_recommendation(
     return RecommendationOutput(
         recommendation_id=cursor.lastrowid,
         user_id=user_id,
-        top_action=top.action,
+        top_action=final_action,
         ranked_actions=ranked_payload,
         confidence=top.confidence,
         estimated_co2_reduction=top.estimated_co2_reduction,
@@ -315,8 +493,8 @@ def update_weights_with_feedback(db: Connection, user_id: int, recommended_actio
 
 
 def _impact_percent(current_action: str, new_action: str) -> float:
-    current = EMISSION_FACTORS.get(current_action, EMISSION_FACTORS["cab"])
-    new = EMISSION_FACTORS.get(new_action, EMISSION_FACTORS["cab"])
+    current = TRANSPORT_EMISSION_KG_PER_KM.get(current_action, TRANSPORT_EMISSION_KG_PER_KM["cab"])
+    new = TRANSPORT_EMISSION_KG_PER_KM.get(new_action, TRANSPORT_EMISSION_KG_PER_KM["cab"])
     if current <= 0:
         return 0.0
     return round(max(0.0, ((current - new) / current) * 100.0), 1)
@@ -332,7 +510,7 @@ def recommend_for_trip(
     current_action: str = "cab",
 ) -> dict:
     profile = _get_user_profile(db, user_id)
-    base_action = current_action if current_action in EMISSION_FACTORS else "cab"
+    base_action = current_action if current_action in TRANSPORT_EMISSION_KG_PER_KM else "cab"
 
     tf_model = TFRSEmbeddingRecommender()
     trained = tf_model.train(db, user_id)
@@ -353,29 +531,91 @@ def recommend_for_trip(
 
     model_action = next((r.action for r in ranked if r.action in TRIP_ACTIONS), "cab")
     model_conf = next((r.confidence for r in ranked if r.action == model_action), 0.0)
-    recommended = model_action
-    reason = (
-        f"TensorFlow model selected {model_action} using your activity history with AQI {int(round(aqi))} "
-        f"and trip distance {distance_km:.2f} km."
-    )
 
-    impact = _impact_percent(base_action, recommended)
+    # --- 🔥 RULE LAYER: override model for short distances ---
+    final_mode = _apply_distance_rules(distance_km, aqi, model_action)
+    reason = _generate_reason(final_mode, distance_km, aqi)
+
+    # Debug logging (MANDATORY)
+    logger.info("[recommend_for_trip] Distance: %.2f km", distance_km)
+    logger.info("[recommend_for_trip] AQI: %.1f", aqi)
+    logger.info("[recommend_for_trip] Model output: %s", model_action)
+    logger.info("[recommend_for_trip] Final recommendation: %s", final_mode)
+    logger.info("[recommend_for_trip] Valid modes: %s", get_valid_modes(distance_km))
+    print(f"[recommend_for_trip] Distance: {distance_km}, AQI: {aqi}, Model output: {model_action}, Final recommendation: {final_mode}, Valid modes: {get_valid_modes(distance_km)}")
+
+    # If rule layer overrode the model, use the overridden confidence
     recommended_conf = model_conf
+    if final_mode != model_action:
+        override_conf = next((r.confidence for r in ranked if r.action == final_mode), model_conf)
+        recommended_conf = max(override_conf, model_conf)
+
+    impact = _impact_percent(base_action, final_mode)
+
+    # Build alternatives for ALL 7 trip-eligible modes
+    # Speeds in km/h used for time estimation
+    MODE_SPEEDS = {
+        "walk": 4.8,
+        "bike": 14.0,
+        "bus": 25.0,
+        "metro": 35.0,
+        "train": 80.0,
+        "cab": 30.0,
+        "airplane": 800.0,
+    }
+    valid_modes = get_valid_modes(distance_km)
     alternatives = []
     for action in TRIP_ACTIONS:
-        speed = 4.8 if action == "walk" else 14.0 if action == "bike" else 24.0 if action == "metro" else 26.0
+        speed = MODE_SPEEDS.get(action, 26.0)
         alt_time = round((distance_km / max(speed, 0.1)) * 60.0, 1)
+        emissions = calculate_emission(action, distance_km)
         alternatives.append(
             {
                 "action": action,
-                "emissions": EMISSION_FACTORS[action],
+                "emissions": emissions,
                 "time_min": alt_time,
                 "impact_percent_vs_current": _impact_percent(base_action, action),
+                "valid": action in valid_modes,
             }
         )
 
+    # Build the full options list (all modes with emission + validity)
+    options = [
+        {
+            "mode": m,
+            "emission": calculate_emission(m, distance_km),
+            "valid": m in valid_modes,
+        }
+        for m in TRANSPORT_MODES.keys()
+    ]
+
+    # Persist the recommendation for tracking
+    cursor = db.execute(
+        """
+        INSERT INTO recommendations
+        (user_id, prediction, recommendation, impact_percent, top_action, ranked_actions_json, confidence, estimated_co2_reduction, model_name, context_aqi, context_temp, context_traffic, context_distance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            f"Likely next action: {base_action}",
+            f"Use {final_mode}",
+            impact,
+            final_mode,
+            json.dumps(alternatives),
+            float(recommended_conf),
+            calculate_emission(final_mode, distance_km),
+            "tensorflow-recommenders",
+            aqi,
+            28.0,
+            60.0,
+            distance_km,
+        ),
+    )
+
     return {
-        "recommended_action": recommended,
+        "recommendation_id": cursor.lastrowid,
+        "recommended_action": final_mode,
         "impact_percent": impact,
         "confidence": round(float(recommended_conf), 3),
         "reason": reason,
@@ -384,13 +624,16 @@ def recommend_for_trip(
             "distance_km": float(distance_km),
             "duration_min": float(duration_min),
             "emissions": {
-                "current": EMISSION_FACTORS.get(base_action, EMISSION_FACTORS["cab"]),
-                "recommended": EMISSION_FACTORS[recommended],
+                "current": TRANSPORT_EMISSION_KG_PER_KM.get(base_action, TRANSPORT_EMISSION_KG_PER_KM["cab"]),
+                "recommended": calculate_emission(final_mode, distance_km),
             },
             "model_action": model_action,
+            "rule_override": final_mode != model_action,
             "current_action": base_action,
+            "valid_modes": valid_modes,
         },
         "alternatives": alternatives,
+        "options": options,
         "model_name": "tensorflow-recommenders",
         "user_preference": profile.get("preferred_transport"),
     }

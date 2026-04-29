@@ -4,6 +4,9 @@ TRANSPORT_EMISSION_KG_PER_KM = {
     "cab": 0.192,
     "car": 0.171,
     "metro": 0.035,
+    "bus": 0.08,
+    "train": 0.04,
+    "airplane": 0.25,
     "public_transport": 0.04,
     "carpool": 0.09,
     "bike": 0.0,
@@ -17,6 +20,9 @@ WASTE_EMISSION_KG_PER_KG = 0.57
 
 ACTION_POINTS = {
     "metro": 50,
+    "bus": 45,
+    "train": 55,
+    "airplane": -40,
     "public_transport": 50,
     "carpool": 45,
     "bike": 60,
