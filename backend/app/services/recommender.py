@@ -518,6 +518,7 @@ def recommend_for_trip(
     trained = False
     model_conf = 0.5
     model_action = base_action
+    ranked = []
     
     try:
         tf_model = TFRSEmbeddingRecommender()
