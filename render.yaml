@@ -1,0 +1,24 @@
+# render.yaml — Infrastructure-as-code for Render.com
+# Deploy with: Connect GitHub repo → Render auto-detects this file
+
+services:
+  # ── Backend API (FastAPI + TensorFlow) ──────────────────────────
+  - type: web
+    name: carbon-guardian-api
+    runtime: python
+    region: singapore  # closest to India
+    plan: free
+    rootDir: backend
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: WAQI_API_TOKEN
+        sync: false  # set manually in Render dashboard
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: DATAGOV_API_KEY
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true

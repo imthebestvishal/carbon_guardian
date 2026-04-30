@@ -36,12 +36,13 @@ def startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "Carbon Guardian AI"}
+    return {"status": "ok", "service": "Carbon Guardian AI", "env": os.getenv("RENDER", "local")}
 
 
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
-    return RedirectResponse(url="http://127.0.0.1:5173", status_code=307)
+    frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173")
+    return RedirectResponse(url=frontend_url, status_code=307)
 
 
 app.include_router(api.router)
