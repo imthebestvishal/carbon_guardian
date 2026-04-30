@@ -491,20 +491,20 @@ async def fetch_environment(lat: float, lon: float, city_hint: str | None = None
         aqi_station = None
         co2_ppm = 420.0
 
-        # PRIORITY ORDER: OpenWeather (global, reliable) → WAQI → Data.gov.in
-        if openweather_key:
-            aqi_value, components = await _fetch_openweather_aqi(lat, lon, openweather_key)
-            aqi_source = "OpenWeather"
-            aqi_station = None
-            co2_ppm = round(420 + (float(components.get("co", 0.0)) / 1000.0), 1)
-            logger.info("[AQI] OpenWeather live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
-        elif waqi_token:
+        # PRIORITY ORDER: WAQI (user requested) → OpenWeather → Data.gov.in
+        if waqi_token:
             aqi_value, waqi_city_name = await _fetch_waqi_aqi(lat, lon, waqi_token)
             aqi_source = "WAQI"
             aqi_station = waqi_city_name or None
             if not location["city"] and waqi_city_name:
                 city = waqi_city_name
             logger.info("[AQI] WAQI live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
+        elif openweather_key:
+            aqi_value, components = await _fetch_openweather_aqi(lat, lon, openweather_key)
+            aqi_source = "OpenWeather"
+            aqi_station = None
+            co2_ppm = round(420 + (float(components.get("co", 0.0)) / 1000.0), 1)
+            logger.info("[AQI] OpenWeather live AQI=%d for (%.4f, %.4f)", aqi_value, lat, lon)
         elif datagov_key:
             if _cached_is_fresh(cached_nearby, DATAGOV_MIN_REFRESH_SECONDS):
                 cached_aqi = _validated_aqi(cached_nearby.get("aqi"))
