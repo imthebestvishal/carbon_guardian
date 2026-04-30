@@ -397,23 +397,25 @@ def get_recommendation(
     try:
         tf_model = TFRSEmbeddingRecommender()
         trained = tf_model.train(db, user_id)
+        if trained:
+            ranked = tf_model.rank(user_id, aqi, temperature, traffic, distance_km, time_of_day, base_action)
     except Exception as exc:
-        raise RuntimeError(f"TensorFlow recommender unavailable: {exc}") from exc
+        logger.warning(f"AI Model unavailable, falling back: {exc}")
+        trained = False
+        ranked = []
 
-    if not trained:
-        raise RuntimeError("TensorFlow model needs more feedback/activity data before serving recommendations.")
+    model_name = "tensorflow-recommenders" if trained and ranked else "rule-based-fallback"
 
-    ranked = tf_model.rank(user_id, aqi, temperature, traffic, distance_km, time_of_day, base_action)
-    if not ranked:
-        raise RuntimeError("TensorFlow model produced no ranked actions.")
-
-    model_name = "tensorflow-recommenders"
-
-    # --- Model's raw top pick ---
-    model_top = ranked[0]
+    if ranked:
+        model_top = ranked[0]
+        model_action = model_top.action
+    else:
+        model_top = RankedRecommendation(action=base_action, score=1.0, confidence=1.0, estimated_co2_reduction=0.0, reason="Fallback")
+        model_action = base_action
+        ranked = [model_top]
 
     # --- 🔥 RULE LAYER: override model for short distances ---
-    final_action = _apply_distance_rules(distance_km, aqi, model_top.action)
+    final_action = _apply_distance_rules(distance_km, aqi, model_action)
 
     # Debug logging (MANDATORY)
     logger.info("[get_recommendation] Distance: %.2f km", distance_km)
@@ -512,25 +514,29 @@ def recommend_for_trip(
     profile = _get_user_profile(db, user_id)
     base_action = current_action if current_action in TRANSPORT_EMISSION_KG_PER_KM else "cab"
 
-    tf_model = TFRSEmbeddingRecommender()
-    trained = tf_model.train(db, user_id)
-    if not trained:
-        raise RuntimeError("TensorFlow model needs more user feedback/activity data.")
-
-    ranked = tf_model.rank(
-        user_id=user_id,
-        aqi=aqi,
-        temp=28.0,
-        traffic=60.0,
-        distance=distance_km,
-        hour=datetime.now().hour,
-        baseline_action=base_action,
-    )
-    if not ranked:
-        raise RuntimeError("TensorFlow model produced no ranked actions.")
-
-    model_action = next((r.action for r in ranked if r.action in TRIP_ACTIONS), "cab")
-    model_conf = next((r.confidence for r in ranked if r.action == model_action), 0.0)
+    tf_model = None
+    trained = False
+    model_conf = 0.5
+    model_action = base_action
+    
+    try:
+        tf_model = TFRSEmbeddingRecommender()
+        trained = tf_model.train(db, user_id)
+        if trained:
+            ranked = tf_model.rank(
+                user_id=user_id,
+                aqi=aqi,
+                temp=28.0,
+                traffic=60.0,
+                distance=distance_km,
+                hour=datetime.now().hour,
+                baseline_action=base_action,
+            )
+            if ranked:
+                model_action = next((r.action for r in ranked if r.action in TRIP_ACTIONS), base_action)
+                model_conf = next((r.confidence for r in ranked if r.action == model_action), 0.5)
+    except Exception as exc:
+        logger.warning(f"AI Model unavailable, falling back to rule-based engine: {exc}")
 
     # --- 🔥 RULE LAYER: override model for short distances ---
     final_mode = _apply_distance_rules(distance_km, aqi, model_action)
